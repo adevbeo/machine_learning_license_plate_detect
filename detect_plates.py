@@ -10,8 +10,21 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from plate_ocr import (
+    PlateOCRResult,
+    load_char_model,
+    plate_layout_score,
+    recognize_plate,
+    recognize_plate_easyocr_text,
+    segment_plate_characters,
+)
+
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+HAAR_CASCADE_FILES = (
+    ("haar_plate", "haarcascade_russian_plate_number.xml"),
+    ("haar_plate_16", "haarcascade_license_plate_rus_16stages.xml"),
+)
 
 CANDIDATE_FIELDNAMES = [
     "image",
@@ -34,6 +47,37 @@ CANDIDATE_FIELDNAMES = [
     "edge_density",
     "blue_ratio",
     "suggested_label",
+    "label",
+]
+
+DETECTION_FIELDNAMES = [
+    "image",
+    "found",
+    "score",
+    "x",
+    "y",
+    "w",
+    "h",
+    "plate_text",
+    "compact_text",
+    "ocr_confidence",
+    "char_count",
+    "plate_path",
+    "error",
+]
+
+CHARACTER_FIELDNAMES = [
+    "image",
+    "plate_path",
+    "char_path",
+    "line_index",
+    "char_index",
+    "char",
+    "confidence",
+    "x",
+    "y",
+    "w",
+    "h",
     "label",
 ]
 
@@ -202,6 +246,33 @@ def contour_candidate_boxes(mask: np.ndarray) -> list[np.ndarray]:
     return boxes
 
 
+def haar_plate_candidate_boxes(gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    image_h, image_w = gray.shape[:2]
+    candidates: list[tuple[str, np.ndarray]] = []
+    for source, filename in HAAR_CASCADE_FILES:
+        cascade_path = str(Path(cv2.data.haarcascades) / filename)
+        cascade = cv2.CascadeClassifier(cascade_path)
+        if cascade.empty():
+            continue
+        rects = cascade.detectMultiScale(
+            gray,
+            scaleFactor=1.05,
+            minNeighbors=3,
+            minSize=(max(30, image_w // 12), max(12, image_h // 25)),
+            flags=cv2.CASCADE_SCALE_IMAGE,
+        )
+        for x, y, w, h in rects:
+            x, y, w, h = padded_bbox((int(x), int(y), int(w), int(h)), (image_h, image_w), 0.08, 0.18)
+            aspect = w / float(max(1, h))
+            area_ratio = (w * h) / float(max(1, image_w * image_h))
+            if not 1.4 <= aspect <= 7.5:
+                continue
+            if not 0.006 <= area_ratio <= 0.42:
+                continue
+            candidates.append((source, bbox_to_box((x, y, w, h))))
+    return candidates
+
+
 def bbox_to_box(bbox: tuple[int, int, int, int]) -> np.ndarray:
     x, y, w, h = bbox
     return np.array(
@@ -235,11 +306,11 @@ def find_character_components(gray: np.ndarray) -> list[CharacterComponent]:
 
     for label in range(1, num_labels):
         x, y, w, h, area = (int(value) for value in stats[label])
-        if area < 8 or area > image_h * image_w * 0.008:
+        if area < 8 or area > image_h * image_w * 0.06:
             continue
-        if h < max(8, image_h * 0.025) or h > max(45, image_h * 0.25):
+        if h < max(8, image_h * 0.025) or h > max(45, image_h * 0.62):
             continue
-        if w < 2 or w > max(28, image_w * 0.12):
+        if w < 2 or w > max(28, image_w * 0.24):
             continue
 
         aspect = h / float(max(1, w))
@@ -615,6 +686,7 @@ def dedupe_candidate_boxes(candidates: list[tuple[str, np.ndarray]], iou_thresho
 
 def primary_candidate_boxes(image: np.ndarray, gray: np.ndarray, mask: np.ndarray) -> list[tuple[str, np.ndarray]]:
     candidates: list[tuple[str, np.ndarray]] = []
+    candidates.extend(haar_plate_candidate_boxes(gray))
     for source, boxes in (
         ("blue", blue_plate_candidate_boxes(image)),
         ("char_group", character_group_candidate_boxes(gray)),
@@ -909,11 +981,11 @@ def score_candidate(
     x, y, w, h = cv2.boundingRect(box.astype(np.int32))
     x, y, w, h = padded_bbox((x, y, w, h), (image_h, image_w), pad_x_ratio=0.12, pad_y_ratio=0.28)
 
-    if w < image_w * 0.08 or h < image_h * 0.035:
+    if w < image_w * 0.08 or h < image_h * 0.05:
         return -1.0, (x, y, w, h), image[y : y + h, x : x + w]
 
     aspect = w / float(max(1, h))
-    if not 0.75 <= aspect <= 7.2:
+    if not 0.60 <= aspect <= 7.2:
         return -1.0, (x, y, w, h), image[y : y + h, x : x + w]
 
     roi_gray = gray[y : y + h, x : x + w]
@@ -961,6 +1033,12 @@ def score_candidate(
     density_score = min(density / 0.22, 1.0)
     edge_score = min(edge_density / 0.55, 1.0)
     area_score = 1.0 - min(abs(area_ratio - 0.045) / 0.12, 1.0)
+    oversize_penalty = max(0.0, min((area_ratio - 0.30) / 0.25, 1.0))
+    low_contrast_penalty = max(0.0, min((45.0 - contrast) / 15.0, 1.0))
+    weak_one_line_penalty = 1.0 if aspect > 2.0 and contrast < 115.0 and blue_ratio < 0.12 else 0.0
+    small_area_penalty = max(0.0, min((0.012 - area_ratio) / 0.008, 1.0))
+    bottom_edge_penalty = 1.0 if center_y > 0.88 and area_ratio < 0.055 else 0.0
+    off_center_small_penalty = 1.0 if area_ratio < 0.085 and abs(center_x - 0.5) > 0.28 else 0.0
 
     score = (
         2.5 * char_score
@@ -975,8 +1053,65 @@ def score_candidate(
         + 0.3 * light_score
         + 1.2 * multi_line_score
         + 1.8 * blue_score
+        - 2.5 * oversize_penalty
+        - 2.2 * low_contrast_penalty
+        - 2.0 * weak_one_line_penalty
+        - 2.4 * small_area_penalty
+        - 2.5 * bottom_edge_penalty
+        - 2.4 * off_center_small_penalty
     )
     return score, (x, y, w, h), roi_color
+
+
+def refine_bbox_from_characters(
+    image: np.ndarray,
+    bbox: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    image_h, image_w = image.shape[:2]
+    x, y, w, h = bbox
+    crop = image[y : y + h, x : x + w]
+    segments = segment_plate_characters(crop)
+    if len(segments) < 5:
+        return bbox
+
+    x1 = min(segment.bbox[0] for segment in segments)
+    y1 = min(segment.bbox[1] for segment in segments)
+    x2 = max(segment.bbox[0] + segment.bbox[2] for segment in segments)
+    y2 = max(segment.bbox[1] + segment.bbox[3] for segment in segments)
+    char_heights = np.array([segment.bbox[3] for segment in segments], dtype=np.float32)
+    median_h = float(np.median(char_heights))
+    line_count = len({segment.line_index for segment in segments})
+    area_ratio = (w * h) / float(max(1, image_w * image_h))
+
+    if line_count == 2 and area_ratio < 0.65:
+        return bbox
+
+    if line_count == 1:
+        pad_x = int(round(median_h * 0.85))
+        pad_y = int(round(median_h * 0.45))
+    elif area_ratio > 0.65:
+        pad_x = int(round(median_h * 0.45))
+        pad_y = int(round(median_h * 0.25))
+    else:
+        pad_x = int(round(median_h * 0.80))
+        pad_y = int(round(median_h * 0.80))
+    local = clamp_bbox(
+        x1 - pad_x,
+        y1 - pad_y,
+        (x2 - x1) + 2 * pad_x,
+        (y2 - y1) + 2 * pad_y,
+        w,
+        h,
+    )
+
+    lx, ly, lw, lh = local
+    if lw * lh < w * h * 0.08:
+        return bbox
+    aspect = lw / float(max(1, lh))
+    if not 0.65 <= aspect <= 7.5:
+        return bbox
+
+    return clamp_bbox(x + lx, y + ly, lw, lh, image_w, image_h)
 
 
 def detect_plate(image: np.ndarray, max_width: int = 900) -> Detection | None:
@@ -984,21 +1119,61 @@ def detect_plate(image: np.ndarray, max_width: int = 900) -> Detection | None:
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
     mask = build_plate_mask(gray)
 
-    def score_candidates(candidates: list[np.ndarray]) -> list[tuple[float, tuple[int, int, int, int], np.ndarray, np.ndarray]]:
+    def score_candidates(candidates: list[tuple[str, np.ndarray]]) -> list[tuple[float, tuple[int, int, int, int], np.ndarray, np.ndarray]]:
         scored_candidates: list[tuple[float, tuple[int, int, int, int], np.ndarray, np.ndarray]] = []
-        for candidate_box in candidates:
+        for source, candidate_box in candidates:
             score, bbox, crop = score_candidate(resized, gray, candidate_box, mask)
             if score > 0:
-                scored_candidates.append((score, bbox, crop, candidate_box))
+                layout_score, layout_count, layout_counts = plate_layout_score(crop)
+                source_bonus = 0.35 if source in {"char_group", "blue"} else 0.0
+                bbox_aspect = bbox[2] / float(max(1, bbox[3]))
+                if source.startswith("haar") and layout_count >= 7:
+                    source_bonus += 2.6
+                    if len(layout_counts) == 1 and bbox_aspect >= 2.0:
+                        source_bonus += 0.8
+                if (
+                    source == "two_line"
+                    and len(layout_counts) == 2
+                    and 2 <= layout_counts[0] <= 4
+                    and 4 <= layout_counts[1] <= 6
+                ):
+                    source_bonus += 1.2
+                if len(layout_counts) == 2 and bbox[3] < resized.shape[0] * 0.12:
+                    source_bonus -= 2.4
+                if source == "char_group" and bbox_aspect < 2.0 and len(layout_counts) == 1:
+                    source_bonus -= 1.2
+                if source == "two_line" and layout_count < 7:
+                    source_bonus -= 0.5
+                if layout_count >= 7:
+                    segments = segment_plate_characters(crop)
+                    if segments:
+                        crop_h, crop_w = crop.shape[:2]
+                        sx1 = min(segment.bbox[0] for segment in segments)
+                        sy1 = min(segment.bbox[1] for segment in segments)
+                        sx2 = max(segment.bbox[0] + segment.bbox[2] for segment in segments)
+                        sy2 = max(segment.bbox[1] + segment.bbox[3] for segment in segments)
+                        margin_x = min(sx1, crop_w - sx2) / float(max(1, crop_w))
+                        margin_y = min(sy1, crop_h - sy2) / float(max(1, crop_h))
+                        if margin_x < 0.025:
+                            source_bonus -= 2.2
+                        elif margin_x < 0.06:
+                            source_bonus -= 0.9
+                        if margin_y < 0.025:
+                            source_bonus -= 1.0
+                score = score + layout_score + source_bonus
+                if score > 0:
+                    scored_candidates.append((score, bbox, crop, candidate_box))
         return scored_candidates
 
-    scored = score_candidates([box for _, box in primary_candidate_boxes(resized, gray, mask)])
+    scored = score_candidates(primary_candidate_boxes(resized, gray, mask))
     if not scored:
-        scored = score_candidates([box for _, box in fallback_candidate_boxes(gray)])
+        scored = score_candidates(fallback_candidate_boxes(gray))
         if not scored:
             return None
 
     score, bbox, _, box = max(scored, key=lambda item: item[0])
+    bbox = refine_bbox_from_characters(resized, bbox)
+    box = bbox_to_box(bbox)
 
     if scale != 1.0:
         inv_scale = 1.0 / scale
@@ -1020,7 +1195,7 @@ def detect_plate(image: np.ndarray, max_width: int = 900) -> Detection | None:
     return Detection(full_box.astype(np.int32), full_bbox, score, crop, mask)
 
 
-def draw_detection(image: np.ndarray, detection: Detection | None) -> np.ndarray:
+def draw_detection(image: np.ndarray, detection: Detection | None, plate_text: str = "") -> np.ndarray:
     debug = image.copy()
     if detection is None:
         return debug
@@ -1028,7 +1203,7 @@ def draw_detection(image: np.ndarray, detection: Detection | None) -> np.ndarray
     x, y, w, h = detection.bbox
     cv2.rectangle(debug, (x, y), (x + w, y + h), (0, 255, 0), 2)
     cv2.polylines(debug, [detection.box.reshape((-1, 1, 2))], True, (0, 180, 255), 2)
-    label = f"plate {detection.score:.2f}"
+    label = f"{plate_text} {detection.score:.2f}".strip() if plate_text else f"plate {detection.score:.2f}"
     cv2.putText(debug, label, (x, max(16, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
     return debug
 
@@ -1041,10 +1216,47 @@ def unique_output_path(base_dir: Path, image_path: Path, suffix: str) -> Path:
     return base_dir.joinpath(*parts).with_name(f"{image_path.stem}{suffix}.png")
 
 
+def save_character_crops(
+    image_path: Path,
+    plate_path: str,
+    ocr: PlateOCRResult,
+    chars_dir: Path,
+) -> list[dict[str, str | int | float]]:
+    rows: list[dict[str, str | int | float]] = []
+    for global_index, character in enumerate(ocr.characters):
+        suffix = (
+            f"_char_{global_index:02d}_"
+            f"l{character.line_index}_c{character.char_index}_{safe_name(character.char)}"
+        )
+        char_path = unique_output_path(chars_dir, image_path, suffix)
+        write_image(char_path, character.crop)
+        x, y, w, h = character.bbox
+        rows.append(
+            {
+                "image": str(image_path),
+                "plate_path": plate_path,
+                "char_path": str(char_path),
+                "line_index": character.line_index,
+                "char_index": character.char_index,
+                "char": character.char,
+                "confidence": round(character.confidence, 4),
+                "x": x,
+                "y": y,
+                "w": w,
+                "h": h,
+                "label": "",
+            }
+        )
+    return rows
+
+
 def process_images(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     output_dir = Path(args.output)
     debug_dir = Path(args.debug_output) if args.debug_output else None
+    chars_dir = Path(args.chars_output) if args.chars_output else None
+    char_report = Path(args.char_report) if args.char_report else Path(args.report).with_name("characters.csv")
+    char_model = load_char_model(Path(args.char_model)) if args.char_model else None
     candidate_dir = Path(args.export_candidates) if args.export_candidates else None
     candidate_report = (
         Path(args.candidate_report)
@@ -1063,6 +1275,7 @@ def process_images(args: argparse.Namespace) -> int:
 
     rows: list[dict[str, str | int | float]] = []
     candidate_rows: list[dict[str, str | int | float]] = []
+    character_rows: list[dict[str, str | int | float]] = []
     found = 0
     for image_path in images:
         try:
@@ -1078,6 +1291,10 @@ def process_images(args: argparse.Namespace) -> int:
                     "y": "",
                     "w": "",
                     "h": "",
+                    "plate_text": "",
+                    "compact_text": "",
+                    "ocr_confidence": 0.0,
+                    "char_count": 0,
                     "plate_path": "",
                     "error": str(exc),
                 }
@@ -1103,6 +1320,10 @@ def process_images(args: argparse.Namespace) -> int:
         plate_path = ""
         bbox: tuple[int | str, int | str, int | str, int | str] = ("", "", "", "")
         score = 0.0
+        plate_text = ""
+        compact_text = ""
+        ocr_confidence = 0.0
+        char_count = 0
         if detection is not None:
             found += 1
             plate_path_obj = unique_output_path(output_dir, image_path, "_plate")
@@ -1110,9 +1331,31 @@ def process_images(args: argparse.Namespace) -> int:
             plate_path = str(plate_path_obj)
             bbox = detection.bbox
             score = detection.score
+            if not args.skip_ocr:
+                try:
+                    ocr = recognize_plate(detection.crop, char_model)
+                    plate_text = ocr.text
+                    compact_text = ocr.compact_text
+                    ocr_confidence = ocr.confidence
+                    char_count = len(ocr.characters)
+                    if args.ocr_engine in {"easyocr", "hybrid"}:
+                        easy_text, easy_compact, easy_confidence = recognize_plate_easyocr_text(detection.crop)
+                        use_easyocr = args.ocr_engine == "easyocr" or (
+                            bool(easy_text)
+                            and easy_confidence >= 0.45
+                            and (ocr_confidence < 0.90 or len(compact_text) not in {8, 9})
+                        )
+                        if use_easyocr:
+                            plate_text = easy_text
+                            compact_text = easy_compact
+                            ocr_confidence = easy_confidence
+                    if chars_dir is not None:
+                        character_rows.extend(save_character_crops(image_path, plate_path, ocr, chars_dir))
+                except Exception as exc:
+                    print(f"[OCR_ERROR] {image_path}: {exc}", file=sys.stderr)
 
         if debug_dir:
-            debug = draw_detection(image, detection)
+            debug = draw_detection(image, detection, plate_text)
             debug_path = unique_output_path(debug_dir, image_path, "_debug")
             write_image(debug_path, debug)
 
@@ -1125,6 +1368,10 @@ def process_images(args: argparse.Namespace) -> int:
                 "y": bbox[1],
                 "w": bbox[2],
                 "h": bbox[3],
+                "plate_text": plate_text,
+                "compact_text": compact_text,
+                "ocr_confidence": round(ocr_confidence, 4),
+                "char_count": char_count,
                 "plate_path": plate_path,
                 "error": "",
             }
@@ -1139,7 +1386,8 @@ def process_images(args: argparse.Namespace) -> int:
     with csv_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["image", "found", "score", "x", "y", "w", "h", "plate_path", "error"],
+            fieldnames=DETECTION_FIELDNAMES,
+            extrasaction="ignore",
         )
         writer.writeheader()
         writer.writerows(rows)
@@ -1149,6 +1397,15 @@ def process_images(args: argparse.Namespace) -> int:
     print(f"Report: {csv_path}")
     if debug_dir:
         print(f"Debug images: {debug_dir}")
+    if chars_dir is not None and not args.skip_ocr:
+        chars_dir.mkdir(parents=True, exist_ok=True)
+        char_report.parent.mkdir(parents=True, exist_ok=True)
+        with char_report.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=CHARACTER_FIELDNAMES, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(character_rows)
+        print(f"Character crops: {chars_dir}")
+        print(f"Character report: {char_report}")
     if candidate_dir is not None and candidate_report is not None:
         candidate_report.parent.mkdir(parents=True, exist_ok=True)
         with candidate_report.open("w", newline="", encoding="utf-8") as f:
@@ -1168,6 +1425,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="outputs/plates", help="Directory for cropped plates.")
     parser.add_argument("--debug-output", default="outputs/debug", help="Directory for annotated images.")
     parser.add_argument("--report", default="outputs/detections.csv", help="CSV report path.")
+    parser.add_argument("--chars-output", default="outputs/chars", help="Directory for extracted character crops. Empty disables saving chars.")
+    parser.add_argument("--char-report", default="outputs/characters.csv", help="CSV report path for extracted characters.")
+    parser.add_argument("--char-model", default="", help="Optional trained character KNN model (.npz) for OCR.")
+    parser.add_argument(
+        "--ocr-engine",
+        choices=["template", "easyocr", "hybrid"],
+        default="hybrid",
+        help="OCR engine. hybrid uses the local template OCR and replaces it with EasyOCR when EasyOCR gives a stronger plate-format result.",
+    )
+    parser.add_argument("--skip-ocr", action="store_true", help="Only detect/crop plates, do not segment or recognize characters.")
     parser.add_argument("--max-width", type=int, default=900, help="Resize large images to this width before detection.")
     parser.add_argument("--limit", type=int, default=0, help="Optional limit for quick testing.")
     parser.add_argument(
