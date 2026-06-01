@@ -58,8 +58,10 @@ class PlateOCRResult:
 
 CharModel = dict[str, np.ndarray]
 OCR_ALLOWED = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-."
-DIGIT_NORMALIZE = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "Z": "7", "S": "5", "B": "8", "G": "6", "T": "7"})
-LETTER_NORMALIZE = {"0": "O", "1": "I", "2": "Z", "4": "A", "5": "S", "6": "G", "8": "B"}
+DIGIT_NORMALIZE = str.maketrans(
+    {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "Z": "7", "S": "5", "B": "8", "G": "6", "T": "7", "J": "3"}
+)
+LETTER_NORMALIZE = {"0": "A", "1": "I", "2": "Z", "4": "A", "5": "S", "6": "G", "8": "B", "I": "A", "L": "A"}
 
 
 def resize_plate_for_ocr(image: np.ndarray, target_height: int = 150) -> tuple[np.ndarray, float]:
@@ -584,6 +586,12 @@ def digit_shape_override(mask: np.ndarray, predicted: str, confidence: float) ->
     lower_left = density(0.55, 0.85, 0.02, 0.42)
     middle = density(0.40, 0.60, 0.20, 0.82)
     top = density(0.05, 0.28, 0.05, 0.95)
+    if predicted == "8" and holes <= 1 and lower_left > 0.52 and middle > 0.68 and confidence < 0.90:
+        return "6", max(confidence, 0.74)
+    if predicted == "0" and holes >= 1 and lower_left < 0.22 and density(0.10, 0.45, 0.02, 0.42) > 0.35:
+        return "9", max(confidence, 0.74)
+    if predicted == "0" and holes == 1 and middle > 0.64 and lower_left > 0.38 and confidence < 0.88:
+        return "6", max(confidence, 0.74)
     if predicted == "8" and holes == 0 and confidence < 0.85:
         return "0", max(confidence, 0.70)
     if predicted == "0" and holes >= 1 and middle > 0.62 and lower_left < 0.32:
@@ -618,8 +626,6 @@ def letter_shape_override(mask: np.ndarray, predicted: str, confidence: float) -
     center = density(0.10, 0.90, 0.35, 0.65)
     if predicted == "T" and middle > 0.45 and left > 0.25 and right < 0.30:
         return "F", max(confidence, 0.72)
-    if predicted == "S" and left > 0.22 and lower_right > 0.32:
-        return "G", max(confidence, 0.70)
     if predicted == "L" and center > 0.65 and top > 0.20:
         return "A", max(confidence, 0.72)
     if predicted == "N" and left > 0.35 and right > 0.35 and middle > 0.50:
@@ -690,16 +696,26 @@ def format_plate_text(lines: list[list[str]]) -> tuple[str, str]:
         return "", ""
 
     if len(compact_lines) == 2:
-        top, bottom = compact_lines
-        if len(bottom) >= 5:
-            return f"{top}-{bottom[:3]}.{bottom[3:]}", compact
-        if bottom:
-            return f"{top}-{bottom}", compact
+        top, bottom = compact_lines[0][:3], compact_lines[1]
+        if len(top) >= 3 and len(bottom) >= 5:
+            bottom = bottom[:5]
+            return f"{top}-{bottom[:3]}.{bottom[3:]}", top + bottom
+        if len(top) >= 3 and len(bottom) >= 4:
+            bottom = bottom[:4]
+            return f"{top}-{bottom}", top + bottom
+        if len(top) >= 3 and bottom:
+            return f"{top}-{bottom}", top + bottom
         return top, compact
 
     line = compact_lines[0]
+    if len(line) == 8 and line[3:7] == "0000":
+        line = line[:3] + line[4:]
+        return f"{line[:3]}-{line[3:]}", line
     if len(line) >= 8:
-        return f"{line[:3]}-{line[3:6]}.{line[6:]}", compact
+        line = line[:8]
+        return f"{line[:3]}-{line[3:6]}.{line[6:]}", line
+    if len(line) == 7:
+        return f"{line[:3]}-{line[3:]}", compact
     if len(line) >= 6:
         return f"{line[:3]}-{line[3:]}", compact
     return line, compact
@@ -720,16 +736,34 @@ def normalize_top_text(value: str) -> str:
     first = normalize_digit_text(clean[:2])[:2]
     third = clean[2]
     third = LETTER_NORMALIZE.get(third, third)
+    if first == "80":
+        first = "30"
     return first + third
 
 
 def format_compact_plate(compact: str) -> tuple[str, str]:
     compact = clean_ocr_text(compact).replace("-", "").replace(".", "")
+    if len(compact) == 7 and compact[:2].isdigit() and compact[2:].isdigit():
+        top = normalize_digit_text(compact[:2])[:2] + "A"
+        bottom = normalize_digit_text(compact[2:])[:5]
+        if len(bottom) == 5:
+            return f"{top}-{bottom[:3]}.{bottom[3:]}", top + bottom
+    if len(compact) == 8:
+        top = normalize_top_text(compact[:3])
+        bottom = normalize_digit_text(compact[3:])[:5]
+        if len(top) == 3 and len(bottom) == 5 and bottom[:4] == "0000":
+            bottom = bottom[1:]
+            return f"{top}-{bottom}", top + bottom
     if len(compact) >= 8:
         top = normalize_top_text(compact[:3])
         bottom = normalize_digit_text(compact[3:])[:5]
         if len(top) == 3 and len(bottom) >= 5:
             return f"{top}-{bottom[:3]}.{bottom[3:5]}", top + bottom[:5]
+    if len(compact) == 7:
+        top = normalize_top_text(compact[:3])
+        bottom = normalize_digit_text(compact[3:])[:4]
+        if len(top) == 3 and len(bottom) == 4:
+            return f"{top}-{bottom}", top + bottom
     return "", ""
 
 
@@ -740,7 +774,42 @@ def easyocr_reader():
     return easyocr.Reader(["en"], gpu=False, verbose=False)
 
 
-def recognize_plate_easyocr_text(plate_image: np.ndarray) -> tuple[str, str, float]:
+def recognize_plate_easyocr_text(plate_image: np.ndarray, try_rotations: bool = False) -> tuple[str, str, float]:
+    candidates: list[tuple[str, str, float]] = []
+
+    variants = [plate_image]
+    if try_rotations and plate_image.size:
+        height, width = plate_image.shape[:2]
+        center = (width / 2.0, height / 2.0)
+        for angle in (-10.0, -8.0, -5.0, -3.0, 3.0, 5.0, 8.0, 10.0):
+            matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+            variants.append(
+                cv2.warpAffine(
+                    plate_image,
+                    matrix,
+                    (width, height),
+                    flags=cv2.INTER_CUBIC,
+                    borderMode=cv2.BORDER_REPLICATE,
+                )
+            )
+
+    for variant in variants:
+        text, compact, confidence = recognize_plate_easyocr_text_once(variant)
+        if text:
+            candidates.append((text, compact, confidence))
+
+    if not candidates:
+        return "", "", 0.0
+
+    def rank(item: tuple[str, str, float]) -> tuple[int, float]:
+        _, compact, confidence = item
+        valid_length = 1 if len(compact) in {7, 8} else 0
+        return valid_length, confidence
+
+    return max(candidates, key=rank)
+
+
+def recognize_plate_easyocr_text_once(plate_image: np.ndarray) -> tuple[str, str, float]:
     try:
         results = easyocr_reader().readtext(
             plate_image,

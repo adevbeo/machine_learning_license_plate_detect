@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
+import json
 import math
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +15,7 @@ import numpy as np
 
 from plate_ocr import (
     PlateOCRResult,
+    format_compact_plate,
     load_char_model,
     plate_layout_score,
     recognize_plate,
@@ -21,6 +25,89 @@ from plate_ocr import (
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+PLATE_LETTERS = set("ABCDEFGHKLMNPRSTUVXYZ")
+VIETNAM_PROVINCE_CODES = {
+    "11",
+    "12",
+    "14",
+    "15",
+    "16",
+    "17",
+    "18",
+    "19",
+    "20",
+    "21",
+    "22",
+    "23",
+    "24",
+    "25",
+    "26",
+    "27",
+    "28",
+    "29",
+    "30",
+    "31",
+    "32",
+    "33",
+    "34",
+    "35",
+    "36",
+    "37",
+    "38",
+    "40",
+    "41",
+    "43",
+    "47",
+    "48",
+    "49",
+    "50",
+    "51",
+    "52",
+    "53",
+    "54",
+    "55",
+    "56",
+    "57",
+    "58",
+    "59",
+    "60",
+    "61",
+    "62",
+    "63",
+    "64",
+    "65",
+    "66",
+    "67",
+    "68",
+    "69",
+    "70",
+    "71",
+    "72",
+    "73",
+    "74",
+    "75",
+    "76",
+    "77",
+    "78",
+    "79",
+    "80",
+    "81",
+    "82",
+    "83",
+    "84",
+    "85",
+    "86",
+    "88",
+    "89",
+    "90",
+    "92",
+    "93",
+    "94",
+    "95",
+    "97",
+    "98",
+    "99",
+}
 HAAR_CASCADE_FILES = (
     ("haar_plate", "haarcascade_russian_plate_number.xml"),
     ("haar_plate_16", "haarcascade_license_plate_rus_16stages.xml"),
@@ -63,6 +150,7 @@ DETECTION_FIELDNAMES = [
     "ocr_confidence",
     "char_count",
     "plate_path",
+    "debug_path",
     "error",
 ]
 
@@ -1195,6 +1283,164 @@ def detect_plate(image: np.ndarray, max_width: int = 900) -> Detection | None:
     return Detection(full_box.astype(np.int32), full_bbox, score, crop, mask)
 
 
+def candidate_review_rank(
+    features: dict[str, float | int | str],
+    crop: np.ndarray,
+    char_model: dict[str, np.ndarray] | None,
+    engine: str,
+    image_shape: tuple[int, int],
+    reference_compact: str = "",
+    reference_confidence: float = 0.0,
+) -> float:
+    source = str(features["source"])
+    base_score = float(features["score"])
+    char_count = int(features["char_count"])
+    bbox_w = int(features["w"])
+    bbox_h = int(features["h"])
+    image_h, image_w = image_shape
+
+    try:
+        _, plate_text, compact_text, ocr_confidence = recognize_hybrid_plate(
+            crop,
+            char_model,
+            engine,
+            try_easyocr_rotations=False,
+        )
+    except Exception:
+        plate_text, compact_text, ocr_confidence = "", "", 0.0
+
+    layout_score, layout_count, layout_counts = plate_layout_score(crop)
+    valid = is_valid_plate_compact(compact_text)
+    width_ratio = bbox_w / float(max(1, image_w))
+    height_ratio = bbox_h / float(max(1, image_h))
+    _, body = split_plate_compact(compact_text)
+
+    rank = 0.35 * base_score + 0.95 * layout_score + 3.6 * ocr_confidence
+    rank += 4.0 if valid else -4.5
+    rank += province_code_score(compact_text)
+    if len(compact_text) == 8:
+        rank += 0.45
+    elif len(compact_text) == 7:
+        rank += 0.20
+
+    if source.startswith("haar") and valid:
+        rank += 0.45
+    if source == "blue" and (not valid or layout_count < 7):
+        rank -= 3.0
+    if source == "blue" and ocr_confidence < 0.60:
+        rank -= 1.8
+    if source == "blue" and char_count > 35:
+        rank -= min(4.0, (char_count - 35) / 6.0)
+    if source == "edge_fallback":
+        rank -= 1.0
+        if width_ratio > 0.75 or height_ratio > 0.36:
+            rank -= 2.2
+    if source == "char_group" and char_count > 45:
+        rank -= min(5.5, (char_count - 45) / 9.0)
+    if char_count > 35:
+        rank -= min(3.5, (char_count - 35) / 10.0)
+    if char_count > 75:
+        rank -= 2.0
+    if valid and width_ratio < 0.22:
+        rank -= 2.1
+    if height_ratio > 0.55 and ocr_confidence < 0.60:
+        rank -= 2.0
+    if len(layout_counts) == 2 and bbox_h < image_h * 0.12:
+        rank -= 2.0
+    if body and len(set(body)) <= 1:
+        rank -= 1.2
+    if plate_text and not valid:
+        rank -= 1.5
+    if reference_compact and is_valid_plate_compact(reference_compact):
+        if compact_text == reference_compact and reference_confidence >= 0.45:
+            rank += 3.0
+        elif (
+            len(compact_text) == len(reference_compact)
+            and compact_text[3:] == reference_compact[3:]
+            and reference_confidence >= 0.55
+        ):
+            rank += 2.4
+        elif (
+            len(compact_text) == len(reference_compact)
+            and compact_text[:3] == reference_compact[:3]
+            and sum(1 for left, right in zip(compact_text[3:], reference_compact[3:]) if left != right) <= 1
+            and reference_confidence >= 0.45
+        ):
+            rank += 2.0
+        elif reference_confidence >= 0.80 and compact_text != reference_compact:
+            rank -= 0.7
+    return rank
+
+
+def detect_plate_ocr_aware(
+    image: np.ndarray,
+    max_width: int,
+    char_model: dict[str, np.ndarray] | None,
+    engine: str,
+    max_candidates: int = 18,
+) -> Detection | None:
+    if engine == "template":
+        return detect_plate(image, max_width=max_width)
+
+    resized, scale = resize_for_detection(image, max_width=max_width)
+    reference_text, reference_compact, reference_confidence = recognize_plate_easyocr_text(
+        resized,
+        try_rotations=True,
+    )
+    reference_text, reference_compact = canonical_plate_text(reference_text, reference_compact)
+    records = ranked_candidate_records(image, max_width=max_width, include_fallback=True)[:max_candidates]
+    if not records:
+        return detect_plate(image, max_width=max_width)
+
+    best: tuple[float, dict[str, float | int | str]] | None = None
+    for features, crop in records:
+        if crop.size == 0:
+            continue
+        rank = candidate_review_rank(
+            features=features,
+            crop=crop,
+            char_model=char_model,
+            engine=engine,
+            image_shape=resized.shape[:2],
+            reference_compact=reference_compact,
+            reference_confidence=reference_confidence,
+        )
+        if best is None or rank > best[0]:
+            best = (rank, features)
+
+    if best is None:
+        return detect_plate(image, max_width=max_width)
+
+    rank, features = best
+    bbox = (
+        int(features["x"]),
+        int(features["y"]),
+        int(features["w"]),
+        int(features["h"]),
+    )
+    bbox = refine_bbox_from_characters(resized, bbox)
+    box = bbox_to_box(bbox)
+
+    if scale != 1.0:
+        inv_scale = 1.0 / scale
+        x, y, w, h = bbox
+        full_bbox = (
+            int(round(x * inv_scale)),
+            int(round(y * inv_scale)),
+            int(round(w * inv_scale)),
+            int(round(h * inv_scale)),
+        )
+        full_bbox = clamp_bbox(*full_bbox, image.shape[1], image.shape[0])
+        full_box = box * inv_scale
+    else:
+        full_bbox = bbox
+        full_box = box
+
+    x, y, w, h = full_bbox
+    crop = image[y : y + h, x : x + w]
+    return Detection(full_box.astype(np.int32), full_bbox, rank, crop, np.zeros(resized.shape[:2], dtype=np.uint8))
+
+
 def draw_detection(image: np.ndarray, detection: Detection | None, plate_text: str = "") -> np.ndarray:
     debug = image.copy()
     if detection is None:
@@ -1250,6 +1496,913 @@ def save_character_crops(
     return rows
 
 
+def canonical_plate_text(text: str, compact: str) -> tuple[str, str]:
+    formatted_text, formatted_compact = format_compact_plate(compact or text)
+    if formatted_text:
+        return formatted_text, formatted_compact
+    return text, compact
+
+
+def is_valid_plate_compact(compact: str) -> bool:
+    if len(compact) not in {7, 8}:
+        return False
+    return (
+        compact[:2].isdigit()
+        and compact[2] in PLATE_LETTERS
+        and compact[3:].isdigit()
+    )
+
+
+def province_code_score(compact: str) -> float:
+    if len(compact) < 2 or not compact[:2].isdigit():
+        return -1.0
+    if compact[:2] in VIETNAM_PROVINCE_CODES:
+        return 0.7
+    return -1.4
+
+
+def split_plate_compact(compact: str) -> tuple[str, str]:
+    if len(compact) < 3:
+        return compact, ""
+    return compact[:3], compact[3:]
+
+
+def format_merged_compact(compact: str) -> tuple[str, str]:
+    text, normalized = format_compact_plate(compact)
+    if text:
+        return text, normalized
+    if len(compact) == 7:
+        return f"{compact[:3]}-{compact[3:]}", compact
+    if len(compact) >= 8:
+        compact = compact[:8]
+        return f"{compact[:3]}-{compact[3:6]}.{compact[6:]}", compact
+    return compact, compact
+
+
+def merge_template_easyocr_result(
+    template_ocr: PlateOCRResult,
+    easy_text: str,
+    easy_compact: str,
+    easy_confidence: float,
+) -> tuple[str, str, float]:
+    template_text, template_compact = canonical_plate_text(template_ocr.text, template_ocr.compact_text)
+    easy_text, easy_compact = canonical_plate_text(easy_text, easy_compact)
+
+    template_valid = is_valid_plate_compact(template_compact)
+    easy_valid = is_valid_plate_compact(easy_compact)
+    if not easy_valid:
+        return template_text, template_compact, template_ocr.confidence
+    if not template_valid:
+        return easy_text, easy_compact, easy_confidence
+
+    template_top, template_body = split_plate_compact(template_compact)
+    easy_top, easy_body = split_plate_compact(easy_compact)
+    template_top_valid = template_compact[:2] in VIETNAM_PROVINCE_CODES and template_compact[2] in PLATE_LETTERS
+    easy_top_valid = easy_compact[:2] in VIETNAM_PROVINCE_CODES and easy_compact[2] in PLATE_LETTERS
+    known_prefix_fix = (template_top[:2], easy_top[:2]) in {
+        ("34", "30"),
+        ("44", "30"),
+        ("66", "56"),
+        ("79", "29"),
+        ("80", "30"),
+    }
+
+    chosen_top = template_top
+    if easy_top_valid and (
+        not template_top_valid
+        or easy_confidence >= template_ocr.confidence + 0.08
+        or (
+            template_body == easy_body
+            and easy_confidence >= 0.45
+            and (known_prefix_fix or easy_confidence >= template_ocr.confidence + 0.08)
+        )
+        or (template_top[:2] == easy_top[:2] and template_top[2:] != easy_top[2:] and easy_confidence >= 0.40)
+        or (template_compact[:2] not in VIETNAM_PROVINCE_CODES and easy_compact[:2] in VIETNAM_PROVINCE_CODES)
+    ):
+        chosen_top = easy_top
+
+    chosen_body = template_body
+    same_serial_length = len(template_body) == len(easy_body)
+    hamming = sum(1 for left, right in zip(template_body, easy_body) if left != right)
+    if easy_body and (
+        (easy_confidence >= 0.84 and (not same_serial_length or hamming <= 2 or not template_valid))
+        or (same_serial_length and easy_confidence >= 0.97)
+        or (same_serial_length and hamming == 1 and easy_confidence >= 0.38)
+        or (template_ocr.confidence < 0.86 and same_serial_length and hamming <= 2)
+        or len(template_body) not in {4, 5}
+        or (same_serial_length and hamming <= 2 and template_ocr.confidence < 0.86 and easy_confidence >= 0.58)
+    ):
+        chosen_body = easy_body
+
+    merged_text, merged_compact = format_merged_compact(chosen_top + chosen_body)
+    merged_confidence = max(template_ocr.confidence, easy_confidence)
+    if merged_compact == easy_compact:
+        merged_confidence = easy_confidence
+    return merged_text, merged_compact, merged_confidence
+
+
+def recognize_hybrid_plate(
+    crop: np.ndarray,
+    char_model: dict[str, np.ndarray] | None,
+    engine: str,
+    try_easyocr_rotations: bool = False,
+) -> tuple[PlateOCRResult, str, str, float]:
+    template_ocr = recognize_plate(crop, char_model)
+    template_text, template_compact = canonical_plate_text(template_ocr.text, template_ocr.compact_text)
+    if engine == "template":
+        return template_ocr, template_text, template_compact, template_ocr.confidence
+
+    easy_text, easy_compact, easy_confidence = recognize_plate_easyocr_text(
+        crop,
+        try_rotations=try_easyocr_rotations,
+    )
+    easy_text, easy_compact = canonical_plate_text(easy_text, easy_compact)
+    if engine == "easyocr":
+        return template_ocr, easy_text, easy_compact, easy_confidence
+
+    merged_text, merged_compact, merged_confidence = merge_template_easyocr_result(
+        PlateOCRResult(template_text, template_compact, template_ocr.confidence, template_ocr.characters),
+        easy_text,
+        easy_compact,
+        easy_confidence,
+    )
+    return template_ocr, merged_text, merged_compact, merged_confidence
+
+
+def report_asset_link(path_value: object, report_path: Path) -> str:
+    raw_path = str(path_value or "").strip()
+    if not raw_path:
+        return ""
+
+    target = Path(raw_path)
+    if not target.is_absolute():
+        target = Path.cwd() / target
+
+    report_dir = report_path.parent
+    if not report_dir.is_absolute():
+        report_dir = Path.cwd() / report_dir
+
+    try:
+        return Path(os.path.relpath(target, report_dir)).as_posix()
+    except ValueError:
+        return target.as_posix()
+
+
+def html_text(value: object) -> str:
+    return html.escape(str(value or ""))
+
+
+def html_attr(value: object) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def render_image_figure(label: str, path_value: object, report_path: Path) -> str:
+    link = report_asset_link(path_value, report_path)
+    label_attr = html_attr(label)
+    label_text = html_text(label)
+    if not link:
+        return f"""
+        <figure class="image-box empty">
+          <div class="missing-image">No image</div>
+          <figcaption>{label_text}</figcaption>
+        </figure>
+        """
+
+    href = html_attr(link)
+    file_name = html_text(Path(str(path_value)).name)
+    return f"""
+    <figure class="image-box">
+      <a href="{href}" target="_blank" rel="noreferrer">
+        <img src="{href}" loading="lazy" alt="{label_attr}">
+      </a>
+      <figcaption><span>{label_text}</span><small>{file_name}</small></figcaption>
+    </figure>
+    """
+
+
+def int_value(value: object) -> int:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+
+
+def render_character_strip(
+    characters: list[dict[str, str | int | float]],
+    report_path: Path,
+) -> str:
+    if not characters:
+        return ""
+
+    chips = []
+    for character in sorted(
+        characters,
+        key=lambda item: (int_value(item.get("line_index")), int_value(item.get("char_index"))),
+    ):
+        char = html_text(character.get("char") or "?")
+        line_index = html_attr(character.get("line_index"))
+        char_index = html_attr(character.get("char_index"))
+        char_path = report_asset_link(character.get("char_path"), report_path)
+        if char_path:
+            src = html_attr(char_path)
+            image = f'<img src="{src}" loading="lazy" alt="{char}">'
+        else:
+            image = '<span class="char-placeholder"></span>'
+        chips.append(
+            f"""
+            <span class="char-chip" title="line {line_index}, char {char_index}">
+              {image}
+              <strong>{char}</strong>
+            </span>
+            """
+        )
+
+    return f"""
+    <div class="chars">
+      <div class="section-label">Segmented characters</div>
+      <div class="char-strip">{''.join(chips)}</div>
+    </div>
+    """
+
+
+def write_html_report(
+    report_path: Path,
+    rows: list[dict[str, str | int | float]],
+    character_rows: list[dict[str, str | int | float]],
+) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+
+    characters_by_plate: dict[str, list[dict[str, str | int | float]]] = {}
+    for character in character_rows:
+        plate_path = str(character.get("plate_path") or "")
+        if plate_path:
+            characters_by_plate.setdefault(plate_path, []).append(character)
+
+    total = len(rows)
+    found = sum(1 for row in rows if str(row.get("found")) == "1")
+    with_text = sum(1 for row in rows if str(row.get("plate_text") or row.get("compact_text") or "").strip())
+    missed = total - found
+
+    cards = []
+    review_records: list[dict[str, object]] = []
+    for index, row in enumerate(rows, start=1):
+        review_id = f"row-{index}"
+        is_found = str(row.get("found")) == "1"
+        status = "FOUND" if is_found else "MISS"
+        status_class = "found" if is_found else "miss"
+        plate_text = str(row.get("plate_text") or "").strip()
+        compact_text = str(row.get("compact_text") or "").strip()
+        display_plate = plate_text or compact_text or ("NO OCR" if is_found else "MISS")
+        image_path = str(row.get("image") or "")
+        image_name = Path(image_path).name if image_path else f"row-{index}"
+        bbox = ", ".join(str(row.get(name) or "") for name in ("x", "y", "w", "h")).strip(", ")
+        search_text = " ".join(
+            str(row.get(name) or "")
+            for name in ("image", "plate_text", "compact_text", "score", "ocr_confidence", "error")
+        )
+        plate_path = str(row.get("plate_path") or "")
+        error = str(row.get("error") or "").strip()
+        error_block = f'<div class="error">{html_text(error)}</div>' if error else ""
+        compact_block = f'<span>Compact: <b>{html_text(compact_text)}</b></span>' if compact_text else ""
+        char_strip = render_character_strip(characters_by_plate.get(plate_path, []), report_path)
+        review_records.append(
+            {
+                "id": review_id,
+                "index": index,
+                "image": image_path,
+                "found": 1 if is_found else 0,
+                "score": row.get("score"),
+                "x": row.get("x"),
+                "y": row.get("y"),
+                "w": row.get("w"),
+                "h": row.get("h"),
+                "bbox": bbox,
+                "plate_text": plate_text,
+                "compact_text": compact_text,
+                "ocr_confidence": row.get("ocr_confidence"),
+                "char_count": row.get("char_count"),
+                "plate_path": plate_path,
+                "debug_path": row.get("debug_path") or "",
+                "error": error,
+            }
+        )
+
+        cards.append(
+            f"""
+            <article class="result-card {status_class}" data-status="{status_class}" data-review-id="{html_attr(review_id)}" data-search="{html_attr(search_text)}">
+              <div class="card-head">
+                <div>
+                  <div class="row-index">#{index}</div>
+                  <h2>{html_text(image_name)}</h2>
+                  <p>{html_text(image_path)}</p>
+                </div>
+                <span class="status {status_class}">{status}</span>
+              </div>
+              <div class="plate-line">{html_text(display_plate)}</div>
+              <div class="review-panel">
+                <div class="review-actions" role="group" aria-label="Review result">
+                  <label class="choice"><input type="radio" name="review-{index}" value="correct"> Correct</label>
+                  <label class="choice wrong-choice"><input type="radio" name="review-{index}" value="wrong"> Wrong</label>
+                  <button type="button" class="clear-review">Clear</button>
+                </div>
+                <input class="actual-text" type="text" placeholder="Actual plate when wrong">
+              </div>
+              <div class="meta">
+                <span>Score: <b>{html_text(row.get("score"))}</b></span>
+                <span>OCR: <b>{html_text(row.get("ocr_confidence"))}</b></span>
+                <span>Chars: <b>{html_text(row.get("char_count"))}</b></span>
+                <span>BBox: <b>{html_text(bbox)}</b></span>
+                {compact_block}
+              </div>
+              {error_block}
+              <div class="media-grid">
+                {render_image_figure("Original", row.get("image"), report_path)}
+                {render_image_figure("Plate crop", row.get("plate_path"), report_path)}
+                {render_image_figure("Debug bbox", row.get("debug_path"), report_path)}
+              </div>
+              {char_strip}
+            </article>
+            """
+        )
+
+    review_json = json.dumps(review_records, ensure_ascii=False).replace("</", "<\\/")
+    html_doc = f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Plate Detection Review</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --text: #17212b;
+      --muted: #5f6b7a;
+      --line: #d9e1ea;
+      --ok: #176b45;
+      --ok-bg: #e7f5ed;
+      --bad: #9b2c2c;
+      --bad-bg: #fdecec;
+      --accent: #2457a6;
+      --shadow: 0 1px 2px rgba(20, 32, 45, 0.08);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Arial, Helvetica, sans-serif;
+      line-height: 1.4;
+    }}
+    header {{
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.96);
+      backdrop-filter: blur(8px);
+    }}
+    .topbar {{
+      max-width: 1480px;
+      margin: 0 auto;
+      padding: 16px 20px;
+      display: grid;
+      gap: 14px;
+      grid-template-columns: 1fr auto;
+      align-items: center;
+    }}
+    h1 {{
+      margin: 0 0 6px;
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }}
+    .summary {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .summary span {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 4px 8px;
+      background: #fbfcfd;
+    }}
+    .tools {{
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      justify-content: end;
+      flex-wrap: wrap;
+    }}
+    input[type="search"] {{
+      width: min(360px, 38vw);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 9px 11px;
+      font-size: 14px;
+      background: #ffffff;
+    }}
+    button {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #ffffff;
+      color: var(--text);
+      font-size: 13px;
+      cursor: pointer;
+    }}
+    button:hover {{
+      border-color: #9fb2c6;
+      background: #f7faff;
+    }}
+    label.toggle {{
+      display: inline-flex;
+      gap: 7px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: var(--muted);
+      background: #ffffff;
+      font-size: 13px;
+      white-space: nowrap;
+    }}
+    main {{
+      max-width: 1480px;
+      margin: 0 auto;
+      padding: 18px 20px 34px;
+      display: grid;
+      gap: 14px;
+    }}
+    .result-card {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: 14px;
+    }}
+    .result-card.review-correct {{
+      border-left: 5px solid var(--ok);
+    }}
+    .result-card.review-wrong {{
+      border-left: 5px solid var(--bad);
+    }}
+    .card-head {{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: start;
+    }}
+    .row-index {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    h2 {{
+      margin: 1px 0 2px;
+      font-size: 17px;
+      line-height: 1.25;
+      letter-spacing: 0;
+      overflow-wrap: anywhere;
+    }}
+    p {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }}
+    .status {{
+      border-radius: 6px;
+      padding: 5px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }}
+    .status.found {{ color: var(--ok); background: var(--ok-bg); }}
+    .status.miss {{ color: var(--bad); background: var(--bad-bg); }}
+    .plate-line {{
+      margin: 12px 0 8px;
+      border-left: 4px solid var(--accent);
+      padding: 7px 10px;
+      background: #f7faff;
+      font-size: 30px;
+      font-weight: 800;
+      letter-spacing: 0;
+      overflow-wrap: anywhere;
+    }}
+    .review-panel {{
+      margin: 0 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fbfcfd;
+      display: grid;
+      grid-template-columns: auto minmax(220px, 1fr);
+      gap: 10px;
+      align-items: center;
+    }}
+    .review-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }}
+    .choice {{
+      display: inline-flex;
+      gap: 6px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 7px 9px;
+      background: #ffffff;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .choice input {{
+      margin: 0;
+    }}
+    .wrong-choice {{
+      color: var(--bad);
+    }}
+    .clear-review {{
+      color: var(--muted);
+    }}
+    .actual-text {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #ffffff;
+      color: var(--text);
+      font-size: 14px;
+      min-width: 0;
+    }}
+    .meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .meta span {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 4px 7px;
+      background: #fbfcfd;
+    }}
+    .meta b {{ color: var(--text); }}
+    .error {{
+      margin-bottom: 12px;
+      border: 1px solid #f0b8b8;
+      border-radius: 6px;
+      padding: 8px 10px;
+      background: #fff5f5;
+      color: var(--bad);
+      font-size: 13px;
+    }}
+    .media-grid {{
+      display: grid;
+      grid-template-columns: minmax(260px, 1.2fr) minmax(180px, 0.8fr) minmax(260px, 1.2fr);
+      gap: 10px;
+      align-items: stretch;
+    }}
+    .image-box {{
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #f9fbfd;
+      overflow: hidden;
+      min-height: 180px;
+      display: grid;
+      grid-template-rows: 1fr auto;
+    }}
+    .image-box a {{
+      display: grid;
+      place-items: center;
+      min-height: 170px;
+      padding: 8px;
+      background: #101820;
+    }}
+    .image-box img {{
+      max-width: 100%;
+      max-height: 360px;
+      object-fit: contain;
+      display: block;
+    }}
+    .image-box figcaption {{
+      border-top: 1px solid var(--line);
+      padding: 7px 8px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 12px;
+      min-width: 0;
+    }}
+    .image-box figcaption small {{
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      max-width: 60%;
+    }}
+    .image-box.empty {{
+      min-height: 180px;
+    }}
+    .missing-image {{
+      display: grid;
+      place-items: center;
+      min-height: 170px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .chars {{
+      margin-top: 12px;
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }}
+    .section-label {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }}
+    .char-strip {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+    }}
+    .char-chip {{
+      width: 58px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #ffffff;
+      display: grid;
+      gap: 4px;
+      justify-items: center;
+      padding: 5px;
+    }}
+    .char-chip img, .char-placeholder {{
+      width: 42px;
+      height: 54px;
+      object-fit: contain;
+      background: #111820;
+      display: block;
+    }}
+    .char-chip strong {{
+      font-size: 16px;
+      line-height: 1;
+    }}
+    .hidden {{ display: none; }}
+    @media (max-width: 980px) {{
+      .topbar {{
+        grid-template-columns: 1fr;
+      }}
+      .tools {{
+        justify-content: start;
+        flex-wrap: wrap;
+      }}
+      input[type="search"] {{
+        width: min(100%, 460px);
+      }}
+      .media-grid {{
+        grid-template-columns: 1fr;
+      }}
+      .review-panel {{
+        grid-template-columns: 1fr;
+      }}
+      .plate-line {{
+        font-size: 24px;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="topbar">
+      <div>
+        <h1>Plate Detection Review</h1>
+        <div class="summary">
+          <span>Total: <b>{total}</b></span>
+          <span>Found: <b>{found}</b></span>
+          <span>Miss: <b>{missed}</b></span>
+          <span>With OCR: <b>{with_text}</b></span>
+          <span>Reviewed: <b id="reviewedCount">0</b></span>
+          <span>Correct: <b id="correctCount">0</b></span>
+          <span>Wrong: <b id="wrongCount">0</b></span>
+          <span>Accuracy: <b id="accuracyPct">0.0%</b></span>
+        </div>
+      </div>
+      <div class="tools">
+        <input id="search" type="search" placeholder="Filter image or plate">
+        <label class="toggle"><input id="missOnly" type="checkbox"> Miss only</label>
+        <label class="toggle"><input id="wrongOnly" type="checkbox"> Wrong only</label>
+        <button id="exportWrong" type="button">Export wrong CSV</button>
+        <button id="exportAll" type="button">Export all CSV</button>
+      </div>
+    </div>
+  </header>
+  <main id="results">
+    {''.join(cards)}
+  </main>
+  <script>
+    const REVIEW_ROWS = {review_json};
+    const search = document.getElementById('search');
+    const missOnly = document.getElementById('missOnly');
+    const wrongOnly = document.getElementById('wrongOnly');
+    const cards = Array.from(document.querySelectorAll('.result-card'));
+    const stateKey = 'plate-review:' + location.pathname;
+
+    function loadState() {{
+      try {{
+        return JSON.parse(localStorage.getItem(stateKey) || '{{}}');
+      }} catch (error) {{
+        return {{}};
+      }}
+    }}
+
+    let reviewState = loadState();
+
+    function saveState() {{
+      localStorage.setItem(stateKey, JSON.stringify(reviewState));
+    }}
+
+    function syncCard(card) {{
+      const id = card.dataset.reviewId;
+      const saved = reviewState[id] || {{}};
+      const status = saved.status || '';
+      card.querySelectorAll('input[type="radio"]').forEach((input) => {{
+        input.checked = input.value === status;
+      }});
+      const actualText = card.querySelector('.actual-text');
+      actualText.value = saved.actual_text || '';
+      card.classList.toggle('review-correct', status === 'correct');
+      card.classList.toggle('review-wrong', status === 'wrong');
+    }}
+
+    function updateStats() {{
+      let reviewed = 0;
+      let correct = 0;
+      let wrong = 0;
+      for (const row of REVIEW_ROWS) {{
+        const status = reviewState[row.id]?.status || '';
+        if (status === 'correct' || status === 'wrong') {{
+          reviewed += 1;
+        }}
+        if (status === 'correct') {{
+          correct += 1;
+        }}
+        if (status === 'wrong') {{
+          wrong += 1;
+        }}
+      }}
+      const accuracy = reviewed ? ((correct / reviewed) * 100).toFixed(1) : '0.0';
+      document.getElementById('reviewedCount').textContent = reviewed;
+      document.getElementById('correctCount').textContent = correct;
+      document.getElementById('wrongCount').textContent = wrong;
+      document.getElementById('accuracyPct').textContent = accuracy + '%';
+    }}
+
+    function setReviewStatus(card, status) {{
+      const id = card.dataset.reviewId;
+      const saved = reviewState[id] || {{}};
+      reviewState[id] = {{
+        ...saved,
+        status,
+        actual_text: card.querySelector('.actual-text').value.trim(),
+      }};
+      saveState();
+      syncCard(card);
+      updateStats();
+      applyFilters();
+    }}
+
+    function setActualText(card, value) {{
+      const id = card.dataset.reviewId;
+      const saved = reviewState[id] || {{}};
+      reviewState[id] = {{
+        ...saved,
+        actual_text: value.trim(),
+      }};
+      if (!reviewState[id].status && !reviewState[id].actual_text) {{
+        delete reviewState[id];
+      }}
+      saveState();
+    }}
+
+    function clearReview(card) {{
+      delete reviewState[card.dataset.reviewId];
+      saveState();
+      syncCard(card);
+      updateStats();
+      applyFilters();
+    }}
+
+    function applyFilters() {{
+      const query = search.value.trim().toLowerCase();
+      const onlyMiss = missOnly.checked;
+      const onlyWrong = wrongOnly.checked;
+      for (const card of cards) {{
+        const reviewStatus = reviewState[card.dataset.reviewId]?.status || '';
+        const matchesText = !query || card.dataset.search.toLowerCase().includes(query);
+        const matchesStatus = !onlyMiss || card.dataset.status === 'miss';
+        const matchesReview = !onlyWrong || reviewStatus === 'wrong';
+        card.classList.toggle('hidden', !(matchesText && matchesStatus && matchesReview));
+      }}
+    }}
+
+    function csvValue(value) {{
+      const text = String(value ?? '');
+      if (/[",\\r\\n]/.test(text)) {{
+        return '"' + text.replace(/"/g, '""') + '"';
+      }}
+      return text;
+    }}
+
+    function rowsForExport(onlyWrongRows) {{
+      return REVIEW_ROWS.map((row) => {{
+        const saved = reviewState[row.id] || {{}};
+        return {{
+          ...row,
+          review_status: saved.status || '',
+          actual_text: saved.actual_text || '',
+        }};
+      }}).filter((row) => !onlyWrongRows || row.review_status === 'wrong');
+    }}
+
+    function downloadCsv(filename, rows) {{
+      if (!rows.length) {{
+        alert('No rows to export.');
+        return;
+      }}
+      const columns = [
+        'id',
+        'index',
+        'review_status',
+        'actual_text',
+        'image',
+        'found',
+        'plate_text',
+        'compact_text',
+        'ocr_confidence',
+        'char_count',
+        'score',
+        'x',
+        'y',
+        'w',
+        'h',
+        'bbox',
+        'plate_path',
+        'debug_path',
+        'error',
+      ];
+      const lines = [
+        columns.join(','),
+        ...rows.map((row) => columns.map((column) => csvValue(row[column])).join(',')),
+      ];
+      const blob = new Blob([lines.join('\\r\\n')], {{ type: 'text/csv;charset=utf-8' }});
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      URL.revokeObjectURL(link.href);
+      link.remove();
+    }}
+
+    for (const card of cards) {{
+      card.querySelectorAll('input[type="radio"]').forEach((input) => {{
+        input.addEventListener('change', () => setReviewStatus(card, input.value));
+      }});
+      card.querySelector('.actual-text').addEventListener('input', (event) => {{
+        setActualText(card, event.target.value);
+      }});
+      card.querySelector('.clear-review').addEventListener('click', () => clearReview(card));
+      syncCard(card);
+    }}
+
+    search.addEventListener('input', applyFilters);
+    missOnly.addEventListener('change', applyFilters);
+    wrongOnly.addEventListener('change', applyFilters);
+    document.getElementById('exportWrong').addEventListener('click', () => downloadCsv('review_wrong.csv', rowsForExport(true)));
+    document.getElementById('exportAll').addEventListener('click', () => downloadCsv('review_labels.csv', rowsForExport(false)));
+    updateStats();
+    applyFilters();
+  </script>
+</body>
+</html>
+"""
+    report_path.write_text(html_doc, encoding="utf-8")
+
+
 def process_images(args: argparse.Namespace) -> int:
     input_path = Path(args.input)
     output_dir = Path(args.output)
@@ -1280,7 +2433,15 @@ def process_images(args: argparse.Namespace) -> int:
     for image_path in images:
         try:
             image = read_image(image_path)
-            detection = detect_plate(image, max_width=args.max_width)
+            if args.skip_ocr or args.ocr_engine == "template":
+                detection = detect_plate(image, max_width=args.max_width)
+            else:
+                detection = detect_plate_ocr_aware(
+                    image,
+                    max_width=args.max_width,
+                    char_model=char_model,
+                    engine=args.ocr_engine,
+                )
         except Exception as exc:
             rows.append(
                 {
@@ -1296,6 +2457,7 @@ def process_images(args: argparse.Namespace) -> int:
                     "ocr_confidence": 0.0,
                     "char_count": 0,
                     "plate_path": "",
+                    "debug_path": "",
                     "error": str(exc),
                 }
             )
@@ -1324,6 +2486,7 @@ def process_images(args: argparse.Namespace) -> int:
         compact_text = ""
         ocr_confidence = 0.0
         char_count = 0
+        debug_path = ""
         if detection is not None:
             found += 1
             plate_path_obj = unique_output_path(output_dir, image_path, "_plate")
@@ -1333,22 +2496,25 @@ def process_images(args: argparse.Namespace) -> int:
             score = detection.score
             if not args.skip_ocr:
                 try:
-                    ocr = recognize_plate(detection.crop, char_model)
-                    plate_text = ocr.text
-                    compact_text = ocr.compact_text
-                    ocr_confidence = ocr.confidence
-                    char_count = len(ocr.characters)
+                    ocr, plate_text, compact_text, ocr_confidence = recognize_hybrid_plate(
+                        detection.crop,
+                        char_model,
+                        args.ocr_engine,
+                        try_easyocr_rotations=False,
+                    )
                     if args.ocr_engine in {"easyocr", "hybrid"}:
-                        easy_text, easy_compact, easy_confidence = recognize_plate_easyocr_text(detection.crop)
-                        use_easyocr = args.ocr_engine == "easyocr" or (
-                            bool(easy_text)
-                            and easy_confidence >= 0.45
-                            and (ocr_confidence < 0.90 or len(compact_text) not in {8, 9})
+                        full_easy_text, full_easy_compact, full_easy_confidence = recognize_plate_easyocr_text(
+                            image,
+                            try_rotations=True,
                         )
-                        if use_easyocr:
-                            plate_text = easy_text
-                            compact_text = easy_compact
-                            ocr_confidence = easy_confidence
+                        if is_valid_plate_compact(full_easy_compact):
+                            plate_text, compact_text, ocr_confidence = merge_template_easyocr_result(
+                                PlateOCRResult(plate_text, compact_text, ocr_confidence, ocr.characters),
+                                full_easy_text,
+                                full_easy_compact,
+                                full_easy_confidence,
+                            )
+                    char_count = len(ocr.characters)
                     if chars_dir is not None:
                         character_rows.extend(save_character_crops(image_path, plate_path, ocr, chars_dir))
                 except Exception as exc:
@@ -1356,8 +2522,9 @@ def process_images(args: argparse.Namespace) -> int:
 
         if debug_dir:
             debug = draw_detection(image, detection, plate_text)
-            debug_path = unique_output_path(debug_dir, image_path, "_debug")
-            write_image(debug_path, debug)
+            debug_path_obj = unique_output_path(debug_dir, image_path, "_debug")
+            write_image(debug_path_obj, debug)
+            debug_path = str(debug_path_obj)
 
         rows.append(
             {
@@ -1373,6 +2540,7 @@ def process_images(args: argparse.Namespace) -> int:
                 "ocr_confidence": round(ocr_confidence, 4),
                 "char_count": char_count,
                 "plate_path": plate_path,
+                "debug_path": debug_path,
                 "error": "",
             }
         )
@@ -1395,6 +2563,10 @@ def process_images(args: argparse.Namespace) -> int:
     print(f"Done. Found {found}/{len(images)} plates.")
     print(f"Plate crops: {output_dir}")
     print(f"Report: {csv_path}")
+    if args.html_report:
+        html_report = Path(args.html_report)
+        write_html_report(html_report, rows, character_rows)
+        print(f"HTML report: {html_report}")
     if debug_dir:
         print(f"Debug images: {debug_dir}")
     if chars_dir is not None and not args.skip_ocr:
@@ -1425,6 +2597,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default="outputs/plates", help="Directory for cropped plates.")
     parser.add_argument("--debug-output", default="outputs/debug", help="Directory for annotated images.")
     parser.add_argument("--report", default="outputs/detections.csv", help="CSV report path.")
+    parser.add_argument("--html-report", default="outputs/report.html", help="HTML review report path. Empty disables HTML export.")
     parser.add_argument("--chars-output", default="outputs/chars", help="Directory for extracted character crops. Empty disables saving chars.")
     parser.add_argument("--char-report", default="outputs/characters.csv", help="CSV report path for extracted characters.")
     parser.add_argument("--char-model", default="", help="Optional trained character KNN model (.npz) for OCR.")

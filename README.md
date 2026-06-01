@@ -41,8 +41,29 @@ Ket qua:
 - `outputs/plates`: anh crop bien so.
 - `outputs/debug`: anh goc co ve bbox debug.
 - `outputs/detections.csv`: toa do bbox, diem tin cay, `plate_text` va duong dan crop.
+- `outputs/report.html`: trang review de xem anh goc, crop bien so, bbox debug va text OCR.
 - `outputs/chars`: crop tung ky tu da tach ra.
 - `outputs/characters.csv`: metadata tung ky tu, ky tu du doan va cot `label` de sua.
+
+Neu muon doi duong dan file HTML:
+
+```powershell
+python detect_plates.py --input images --html-report outputs\review.html
+```
+
+Trong trang HTML co the tick `Correct` / `Wrong`, xem ty le dung, loc cac dong sai
+va export `review_wrong.csv`. De gom anh sai vao mot thu muc rieng:
+
+```powershell
+.\.venv\Scripts\python collect_review_mistakes.py --review "$env:USERPROFILE\Downloads\review_wrong.csv" --output outputs\review_wrong
+```
+
+Ket qua gom:
+
+- `outputs/review_wrong/originals`: anh goc cua cac dong sai.
+- `outputs/review_wrong/plates`: crop bien so cua cac dong sai.
+- `outputs/review_wrong/debug`: anh debug bbox cua cac dong sai.
+- `outputs/review_wrong/manifest.csv`: metadata va bien so dung neu da dien trong HTML.
 
 ## Xuat du lieu de train buoc sau
 
