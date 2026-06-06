@@ -72,6 +72,7 @@ def crop_from_bbox(image: np.ndarray, row: dict[str, str]) -> np.ndarray:
 def load_labeled_samples(
     labels_path: Path,
     extractor: HOGFeatureExtractor,
+    require_both_classes: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, DatasetStats]:
     samples: list[np.ndarray] = []
     labels: list[int] = []
@@ -107,7 +108,7 @@ def load_labeled_samples(
     y = np.array(labels, dtype=np.int32)
     positives = int(np.sum(y == 1))
     negatives = int(np.sum(y == -1))
-    if positives == 0 or negatives == 0:
+    if require_both_classes and (positives == 0 or negatives == 0):
         raise ValueError(f"Need both classes to train. positives={positives}, negatives={negatives}")
 
     x = np.vstack(samples).astype(np.float32)
