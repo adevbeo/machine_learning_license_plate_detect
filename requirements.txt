@@ -1,4 +1,2 @@
 numpy>=1.26
 opencv-python>=4.9
-pillow>=10.0
-easyocr>=1.7.2

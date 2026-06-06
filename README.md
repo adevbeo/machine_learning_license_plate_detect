@@ -1,9 +1,32 @@
 # machine_learning_license_plate_detect
 
-Tach bien so xe tu anh bang xu ly anh co dien voi OpenCV. Pipeline nay khong dung
-model deep learning co san: no tim vung co dac trung giong bien so bang tang tuong
-phan, blackhat morphology, bien canny/sobel, contour va bo loc hinh hoc + mat do
-ky tu.
+Phat hien bien so xe bang pipeline co dien HOG + SVM.
+
+Repo nay duoc tach thanh 2 buoc dung theo yeu cau:
+
+- Class 1: tien xu ly patch anh, xam hoa, resize ve cung kich thuoc, trich xuat HOG,
+  train Linear SVM de phan loai `plate` / `non_plate`.
+- Class 2: dung cua so truot quet anh tu tren xuong duoi, trai qua phai. Moi window
+  duoc trich HOG va dua vao SVM. Window co SVM confidence cao nhat se duoc chon lam
+  bbox bien so.
+
+## Cau truc code
+
+```text
+plate_hog_svm/
+  config.py      # cau hinh HOG va sliding window
+  features.py    # tien xu ly + HOG extractor
+  dataset.py     # doc CSV train plate/non-plate
+  training.py    # split data, train/evaluate Linear SVM
+  svm_utils.py   # load/save SVM va metadata margin
+  windows.py     # sinh sliding window va IoU
+  detector.py    # Class 2: quet window bang SVM
+  io_utils.py    # doc/ghi anh, duyet thu muc anh
+  report.py      # CSV/HTML report
+
+train_plate_classifier.py  # CLI train Class 1
+detect_plates.py           # CLI detect Class 2
+```
 
 ## Cai dat
 
@@ -13,109 +36,67 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Chay thu
+## Chuan bi du lieu train
 
-Xu ly toan bo thu muc `images`:
+CSV train can co cot `label` va mot cot duong dan anh, vi du `candidate_path`.
 
-```powershell
-python detect_plates.py --input images --output outputs/plates --debug-output outputs/debug
+Vi du:
+
+```csv
+candidate_path,label
+data/plates/plate_001.png,1
+data/background/bg_001.png,0
 ```
 
-Mac dinh OCR chay che do `hybrid`: template/HOG cuc bo + EasyOCR neu EasyOCR cho
-chuoi hop format bien so hon. Lan chay EasyOCR dau tien se tai model nhan dang.
+Chap nhan nhan duong: `1`, `plate`, `positive`, `bien_so`.
+Chap nhan nhan am: `0`, `-1`, `non_plate`, `background`, `negative`.
 
-Chay nhanh 20 anh dau tien:
+Neu CSV dung anh goc kem bbox thi co the dung cac cot:
 
-```powershell
-python detect_plates.py --input images\val --limit 20
+```csv
+image,x,y,w,h,label
+images/train/car_001.png,120,220,180,55,1
+images/train/car_001.png,20,30,180,55,0
 ```
 
-Chi dung OCR template co dien, khong dung EasyOCR:
-
-```powershell
-python detect_plates.py --input images --ocr-engine template
-```
-
-Ket qua:
-
-- `outputs/plates`: anh crop bien so.
-- `outputs/debug`: anh goc co ve bbox debug.
-- `outputs/detections.csv`: toa do bbox, diem tin cay, `plate_text` va duong dan crop.
-- `outputs/report.html`: trang review de xem anh goc, crop bien so, bbox debug va text OCR.
-- `outputs/chars`: crop tung ky tu da tach ra.
-- `outputs/characters.csv`: metadata tung ky tu, ky tu du doan va cot `label` de sua.
-
-Neu muon doi duong dan file HTML:
-
-```powershell
-python detect_plates.py --input images --html-report outputs\review.html
-```
-
-Trong trang HTML co the tick `Correct` / `Wrong`, xem ty le dung, loc cac dong sai
-va export `review_wrong.csv`. De gom anh sai vao mot thu muc rieng:
-
-```powershell
-.\.venv\Scripts\python collect_review_mistakes.py --review "$env:USERPROFILE\Downloads\review_wrong.csv" --output outputs\review_wrong
-```
-
-Ket qua gom:
-
-- `outputs/review_wrong/originals`: anh goc cua cac dong sai.
-- `outputs/review_wrong/plates`: crop bien so cua cac dong sai.
-- `outputs/review_wrong/debug`: anh debug bbox cua cac dong sai.
-- `outputs/review_wrong/manifest.csv`: metadata va bien so dung neu da dien trong HTML.
-
-## Xuat du lieu de train buoc sau
-
-Detector co the luu nhieu vung ung vien moi anh, kem feature va cot nhan trong
-CSV de review thu cong:
-
-```powershell
-python detect_plates.py --input images --output outputs/plates --debug-output outputs/debug --report outputs/detections.csv --export-candidates outputs/candidates --candidates-per-image 8
-```
-
-Ket qua:
-
-- `outputs/candidates`: crop cac vung ung vien.
-- `outputs/candidates/labels.csv`: metadata + feature cua tung crop.
-- Cot `suggested_label` la goi y tu score hien tai; can tu dien cot `label`.
-- Dien `label=1` neu crop dung la bien so, `label=0` neu khong phai bien so.
-
-Neu muon lay tat ca ung vien thay vi top 8:
-
-```powershell
-python detect_plates.py --input images --export-candidates outputs/candidates --candidates-per-image 0
-```
-
-Sau khi da gan nhan, train classifier bien-so/khong-bien-so bang HOG + OpenCV SVM:
+## Class 1: train HOG + SVM
 
 ```powershell
 python train_plate_classifier.py --labels outputs/candidates/labels.csv --model models/plate_svm.yml
 ```
 
-## Train OCR ky tu
+Ket qua:
 
-OCR mac dinh dung template/HOG co dien nen chi la baseline. De doc dung tren bo anh
-cua ban, hay sua cot `label` trong `outputs/characters.csv`:
+- `models/plate_svm.yml`: OpenCV Linear SVM.
+- `models/plate_svm.json`: metadata HOG va huong raw margin de confidence cao hon nghia la giong bien so hon.
 
-- `char`: ky tu du doan hien tai.
-- `label`: ky tu dung do ban dien lai, vi du `3`, `0`, `F`.
-
-Train model ky tu:
+## Class 2: sliding window detect
 
 ```powershell
-python train_char_classifier.py --labels outputs/characters.csv --model models/char_knn.npz
+python detect_plates.py --input images --model models/plate_svm.yml --output outputs/plates --debug-output outputs/debug
 ```
 
-Chay lai detector voi model OCR da train:
+Ket qua:
+
+- `outputs/plates`: crop window bien so duoc SVM chon.
+- `outputs/debug`: anh goc co bbox.
+- `outputs/detections.csv`: bbox, SVM margin, confidence va so window da quet.
+- `outputs/report.html`: trang HTML xem nhanh ket qua.
+
+Chay nhanh 20 anh:
 
 ```powershell
-python detect_plates.py --input images --output outputs/plates --debug-output outputs/debug --report outputs/detections.csv --chars-output outputs/chars --char-report outputs/characters.csv --char-model models/char_knn.npz
+python detect_plates.py --input images\val --limit 20
 ```
 
-Vi repo hien chua co annotation bbox/chu so that, detector va OCR template chi la
-baseline. Phan export candidate + character CSV tao du lieu de train model loc vung
-bien so va OCR ky tu cho buoc sau.
+Tinh chinh sliding window:
 
-.\.venv\Scripts\python -m pip install -r requirements.txt
-.\.venv\Scripts\python detect_plates.py --input images --output outputs\plates --debug-output outputs\debug --report outputs\detections.csv --chars-output outputs\chars --char-report outputs\characters.csv --ocr-engine hybrid
+```powershell
+python detect_plates.py --input images --stride-ratio 0.2 --window-heights 32,48,64,96,128 --aspect-ratios 1.3,1.6,2.4,3.6,4.5
+```
+
+Ghi chu:
+
+- `--score-threshold 0.0` nghia la chi chap nhan window nam phia positive cua SVM.
+- Giam `--stride-ratio` se quet day hon nhung cham hon.
+- Tang danh sach `--window-heights` hoac `--aspect-ratios` se bao phu nhieu dang bien so hon nhung cham hon.
