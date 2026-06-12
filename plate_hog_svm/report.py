@@ -21,7 +21,7 @@ DETECTION_FIELDNAMES = [
     "ocr_confidence",
     "char_count",
     "plate_path",
-    "debug_path",
+    "annotated_path",
     "error",
 ]
 
@@ -88,8 +88,8 @@ def write_html_report(
               <p>BBox: {html_text(bbox)} | Windows: {html_text(row.get("windows_scanned"))}</p>
               <div class="media">
                 {render_image("Original", row.get("image"), report_path)}
+                {render_image("LinearSVM bbox", row.get("annotated_path"), report_path)}
                 {render_image("Plate crop", row.get("plate_path"), report_path)}
-                {render_image("Debug bbox", row.get("debug_path"), report_path)}
               </div>
               <div class="review">
                 <label><input type="radio" name="row-{index}" value="correct"> Correct</label>
@@ -105,7 +105,7 @@ def write_html_report(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>HOG SVM Plate Detection Report</title>
+  <title>HOG + LinearSVM Plate Detection Report</title>
   <style>
     body {{ margin: 0; font-family: Arial, sans-serif; background: #f6f7f9; color: #18202a; }}
     header.top {{ position: sticky; top: 0; background: #ffffff; border-bottom: 1px solid #d9dee7; padding: 16px 24px; z-index: 1; }}
@@ -126,7 +126,7 @@ def write_html_report(
 </head>
 <body>
   <header class="top">
-    <h1>HOG + SVM Plate Detection</h1>
+    <h1>HOG + LinearSVM Plate Detection</h1>
     <div>Total: <b>{total}</b> | Found: <b>{found}</b> | Miss: <b>{total - found}</b></div>
   </header>
   <main>

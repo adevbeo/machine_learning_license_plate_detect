@@ -17,6 +17,11 @@ from plate_hog_svm.training import (
     stratified_split,
     tune_and_train,
 )
+from plate_hog_svm.visualization import (
+    load_labeled_preview_samples,
+    save_feature_embedding_plot,
+    save_hog_visualization_grid,
+)
 
 
 def parse_float_list(value: str) -> tuple[float, ...]:
@@ -30,14 +35,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Class 1: Extract HOG features, normalize with StandardScaler, "
-            "tune C via RandomizedSearchCV, train LinearSVC, "
+            "tune C via RandomizedSearchCV, train LinearSVM, "
             "evaluate with precision/recall/F1/confusion-matrix."
         ),
     )
     # Data
     parser.add_argument(
         "--labels",
-        default="outputs/candidates/labels.csv",
+        default="outputs/labels.csv",
         help="CSV with image path column and label column.",
     )
     parser.add_argument(
@@ -78,6 +83,48 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Cap on negative samples. 0 = keep all.",
     )
+    # Diagnostics before LinearSVM training
+    parser.add_argument(
+        "--hog-visualization",
+        default="outputs/visualize/hog_visualization.png",
+        help=(
+            "Output image for skimage HOG visualize=True grid. "
+            "Use an empty string to disable."
+        ),
+    )
+    parser.add_argument(
+        "--hog-visualization-limit",
+        type=int,
+        default=12,
+        help="Max labeled crops to include in the HOG visualization grid.",
+    )
+    parser.add_argument(
+        "--feature-plot",
+        default="outputs/visualize/hog_feature_embedding.png",
+        help=(
+            "Output scatter plot for HOG features reduced before LinearSVM training. "
+            "Use an empty string to disable."
+        ),
+    )
+    parser.add_argument(
+        "--feature-plot-method",
+        choices=["pca", "tsne"],
+        default="pca",
+        help="Dimensionality reduction method for the HOG scatter plot.",
+    )
+    parser.add_argument(
+        "--feature-plot-dims",
+        type=int,
+        choices=[2, 3],
+        default=2,
+        help="Scatter plot dimensions: 2 or 3.",
+    )
+    parser.add_argument(
+        "--feature-plot-sample",
+        type=int,
+        default=2000,
+        help="Max HOG samples to draw in the feature scatter plot. 0 = all.",
+    )
     # Hyperparameter search
     parser.add_argument(
         "--c-values",
@@ -106,13 +153,13 @@ def parse_args() -> argparse.Namespace:
         "--max-iter",
         type=int,
         default=10000,
-        help="Max iterations for LinearSVC.",
+        help="Max iterations for LinearSVM.",
     )
     parser.add_argument(
         "--class-weight",
         choices=["balanced", "none"],
         default="balanced",
-        help="Class weighting for LinearSVC. Use 'none' if you already balanced the dataset manually.",
+        help="Class weighting for LinearSVM. Use 'none' if you already balanced the dataset manually.",
     )
     return parser.parse_args()
 
@@ -165,6 +212,7 @@ def main() -> int:
     print(f"      Total: {stats.samples}  (pos={stats.positives}, neg={stats.negatives}, skip={stats.skipped})")
 
     # Merge hard negatives if provided
+    visualization_label_paths = [labels_path]
     if args.hard_negatives:
         hn_path = Path(args.hard_negatives)
         if hn_path.exists():
@@ -178,19 +226,64 @@ def main() -> int:
                 x = np.vstack([x, x_hn])
                 y = np.concatenate([y, y_hn])
                 print(f"      +{hn_stats.samples} hard negative samples added")
+                visualization_label_paths.append(hn_path)
             except Exception as exc:
                 print(f"      Warning: skipping hard negatives: {exc}", file=sys.stderr)
         else:
             print(f"      Warning: --hard-negatives path not found: {hn_path}", file=sys.stderr)
 
+    # Visualize a few HOG images with skimage.feature.hog(..., visualize=True).
+    if args.hog_visualization:
+        hog_vis_path = Path(args.hog_visualization)
+        print(f"[1c]  Writing HOG visualization to {hog_vis_path} ...")
+        try:
+            preview_samples = load_labeled_preview_samples(
+                visualization_label_paths,
+                max_samples=args.hog_visualization_limit,
+            )
+            written = save_hog_visualization_grid(preview_samples, extractor, hog_vis_path)
+            if written:
+                print(f"      HOG visualization samples: {written}")
+            else:
+                print("      Warning: no preview samples available for HOG visualization")
+        except Exception as exc:
+            print(f"      Warning: HOG visualization skipped: {exc}", file=sys.stderr)
+
     # Balance negatives
     x, y = limit_negatives(x, y, args.max_negatives, args.seed)
+
+    # Draw PCA/t-SNE scatter of HOG features before LinearSVM training.
+    if args.feature_plot:
+        feature_plot_path = Path(args.feature_plot)
+        print(
+            f"\n[2/5] HOG feature scatter "
+            f"({args.feature_plot_method.upper()}, {args.feature_plot_dims}D) ..."
+        )
+        try:
+            plot_info = save_feature_embedding_plot(
+                x=x,
+                y=y,
+                output_path=feature_plot_path,
+                method=args.feature_plot_method,
+                dims=args.feature_plot_dims,
+                sample_size=args.feature_plot_sample,
+                seed=args.seed,
+            )
+            print(f"      Plot      : {feature_plot_path}")
+            print(f"      Samples   : {plot_info['samples']}")
+            if "explained_variance_ratio" in plot_info:
+                variance = ", ".join(f"{v:.4f}" for v in plot_info["explained_variance_ratio"])
+                print(f"      PCA var   : {variance}")
+            if "perplexity" in plot_info:
+                print(f"      t-SNE perp: {plot_info['perplexity']:.2f}")
+        except Exception as exc:
+            print(f"      Warning: feature scatter skipped: {exc}", file=sys.stderr)
 
     # Train/val split
     train_idx, val_idx = stratified_split(y, args.val_ratio, args.seed)
     x_train, y_train = x[train_idx], y[train_idx]
     x_val, y_val = x[val_idx], y[val_idx]
-    print(f"\n[2/4] Split: train={len(train_idx)}, val={len(val_idx)}")
+    print(f"\n[3/5] Split: train={len(train_idx)}, val={len(val_idx)}")
 
     # Hyperparameter tuning config
     try:
@@ -207,7 +300,7 @@ def main() -> int:
         max_iter=args.max_iter,
         class_weight=None if args.class_weight == "none" else args.class_weight,
     )
-    print(f"\n[3/4] Tuning + Training (scoring={train_config.scoring}, cv={train_config.cv_folds} folds) ...")
+    print(f"\n[4/5] Tuning + Training (scoring={train_config.scoring}, cv={train_config.cv_folds} folds) ...")
     print(f"      C candidates: {list(train_config.c_values)}")
 
     try:
@@ -224,7 +317,7 @@ def main() -> int:
     model_path = Path(args.model)
     metadata_path = Path(args.metadata) if args.metadata else None
 
-    print(f"\n[4/4] Saving model ...")
+    print(f"\n[5/5] Saving model ...")
     written_metadata = save_model_and_metadata(pipeline, model_path, metadata, metadata_path)
     print(f"      Model    : {model_path}")
     print(f"      Metadata : {written_metadata}")

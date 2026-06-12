@@ -31,7 +31,7 @@ class Detection:
 
 
 def confidence_from_margin(margin: float) -> float:
-    """Chuyển SVM decision score sang confidence [0, 1] bằng sigmoid."""
+    """Chuyển LinearSVM decision score sang confidence [0, 1] bằng sigmoid."""
     value = max(-50.0, min(50.0, float(margin)))
     if value >= 0:
         z = math.exp(-value)
@@ -41,7 +41,7 @@ def confidence_from_margin(margin: float) -> float:
 
 
 class SlidingWindowDetector:
-    """Phát hiện biển số bằng sliding window + sklearn SVM.
+    """Phát hiện biển số bằng sliding window + LinearSVM.
 
     Luồng:
     1. Resize ảnh về max_width.
@@ -184,7 +184,7 @@ def draw_detection(image: np.ndarray, detection: Detection | None) -> np.ndarray
 
     x, y, w, h = detection.bbox
     cv2.rectangle(debug, (x, y), (x + w, y + h), (0, 255, 0), 2)
-    label = f"SVM {detection.confidence:.2f}"
+    label = f"LinearSVM {detection.confidence:.2f}"
     cv2.putText(debug, label, (x, max(16, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
     return debug
 

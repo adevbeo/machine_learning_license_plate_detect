@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help=(
-            "Only keep windows with SVM score > threshold. "
+            "Only keep windows with LinearSVM score > threshold. "
             "Use 0.0 to collect every false positive; use a higher value for more confident false positives."
         ),
     )

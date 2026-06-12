@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import random
 import sys
 from pathlib import Path
 
@@ -38,7 +39,7 @@ def row_for_miss(image_path: Path, error: str = "") -> dict[str, object]:
         "ocr_confidence": "",
         "char_count": "",
         "plate_path": "",
-        "debug_path": "",
+        "annotated_path": "",
         "error": error,
     }
 
@@ -47,7 +48,7 @@ def row_for_detection(
     image_path: Path,
     detection: Detection,
     plate_path: str,
-    debug_path: str,
+    annotated_path: str,
 ) -> dict[str, object]:
     return {
         "image": str(image_path),
@@ -64,14 +65,21 @@ def row_for_detection(
         "ocr_confidence": "",
         "char_count": "",
         "plate_path": plate_path,
-        "debug_path": debug_path,
+        "annotated_path": annotated_path,
         "error": "",
     }
 
 
+def flat_output_path(base_dir: Path, image_path: Path, suffix: str, extension: str = ".png") -> Path:
+    return base_dir / f"{image_path.stem}{suffix}{extension}"
+
+
 def process_images(args: argparse.Namespace) -> int:
     images = iter_images(Path(args.input))
-    if args.limit:
+    if args.sample_size:
+        rng = random.Random(args.seed)
+        images = rng.sample(images, min(args.sample_size, len(images)))
+    elif args.limit:
         images = images[: args.limit]
     if not images:
         print(f"No images found in {args.input}", file=sys.stderr)
@@ -101,8 +109,8 @@ def process_images(args: argparse.Namespace) -> int:
         nms=nms_config,
     )
 
+    plates_dir = Path(args.plates_output)
     output_dir = Path(args.output)
-    debug_dir = Path(args.debug_output) if args.debug_output else None
     rows: list[dict[str, object]] = []
     found_count = 0
 
@@ -124,21 +132,25 @@ def process_images(args: argparse.Namespace) -> int:
         found_count += 1
         best = detections[0]
 
-        plate_path_obj = unique_output_path(output_dir, image_path, "_plate")
+        if args.flat_output:
+            plate_path_obj = flat_output_path(plates_dir, image_path, "_plate")
+        else:
+            plate_path_obj = unique_output_path(plates_dir, image_path, "_plate")
         write_image(plate_path_obj, best.crop)
         plate_path_str = str(plate_path_obj)
 
-        debug_path_str = ""
-        if debug_dir:
-            if args.top_k > 1:
-                debug = draw_detections(image, detections)
-            else:
-                debug = draw_detection(image, best)
-            debug_path_obj = unique_output_path(debug_dir, image_path, "_debug")
-            write_image(debug_path_obj, debug)
-            debug_path_str = str(debug_path_obj)
+        if args.top_k > 1:
+            annotated = draw_detections(image, detections)
+        else:
+            annotated = draw_detection(image, best)
+        if args.flat_output:
+            annotated_path_obj = flat_output_path(output_dir, image_path, "_linearsvm")
+        else:
+            annotated_path_obj = unique_output_path(output_dir, image_path, "_linearsvm")
+        write_image(annotated_path_obj, annotated)
+        annotated_path_str = str(annotated_path_obj)
 
-        rows.append(row_for_detection(image_path, best, plate_path_str, debug_path_str))
+        rows.append(row_for_detection(image_path, best, plate_path_str, annotated_path_str))
 
         if not args.quiet:
             det_info = f"score={best.score:.3f} conf={best.confidence:.3f}"
@@ -148,10 +160,9 @@ def process_images(args: argparse.Namespace) -> int:
 
     write_detection_csv(Path(args.report), rows)
     print(f"\nDone. Found plates in {found_count}/{len(images)} images.")
-    print(f"Plate crops : {output_dir}")
+    print(f"Plates      : {plates_dir}")
+    print(f"Output      : {output_dir}")
     print(f"Report CSV  : {args.report}")
-    if debug_dir:
-        print(f"Debug imgs  : {debug_dir}")
     if args.html_report:
         write_html_report(Path(args.html_report), rows, [])
         print(f"HTML report : {args.html_report}")
@@ -162,18 +173,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Class 2: Multi-scale sliding window scan, HOG feature extraction, "
-            "sklearn SVM scoring, NMS, and best plate window selection."
+            "LinearSVM scoring, NMS, and best plate window selection."
         ),
     )
     parser.add_argument("--input", default="images", help="Image file or directory to process.")
     parser.add_argument("--model", default="models/plate_svm.joblib", help="Sklearn Pipeline (.joblib).")
     parser.add_argument("--metadata", default="", help="Metadata JSON path. Defaults to model path + .json.")
-    parser.add_argument("--output", default="outputs/plates", help="Directory for cropped plate windows.")
-    parser.add_argument(
-        "--debug-output",
-        default="outputs/debug",
-        help="Directory for annotated debug images. Empty string disables.",
-    )
+    parser.add_argument("--plates-output", default="outputs/plates", help="Directory for cropped plate windows.")
+    parser.add_argument("--output", default="outputs/output", help="Directory for images annotated with LinearSVM bbox.")
     parser.add_argument("--report", default="outputs/detections.csv", help="CSV report path.")
     parser.add_argument("--html-report", default="outputs/report.html", help="HTML report path.")
     parser.add_argument("--max-width", type=int, default=900, help="Resize images to this width before scanning.")
@@ -181,7 +188,7 @@ def parse_args() -> argparse.Namespace:
         "--score-threshold",
         type=float,
         default=0.0,
-        help="Minimum SVM decision score to accept a window as plate candidate.",
+        help="Minimum LinearSVM decision score to accept a window as plate candidate.",
     )
     parser.add_argument("--stride-ratio", type=float, default=0.25, help="Sliding window step as fraction of window size.")
     parser.add_argument(
@@ -194,7 +201,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Comma-separated window heights in pixels after max-width resize.",
     )
-    parser.add_argument("--batch-size", type=int, default=256, help="Windows scored per SVM batch.")
+    parser.add_argument("--batch-size", type=int, default=256, help="Windows scored per LinearSVM batch.")
     # NMS params
     parser.add_argument(
         "--iou-threshold",
@@ -209,6 +216,9 @@ def parse_args() -> argparse.Namespace:
         help="Max detections returned per image (default 1). Use >1 for multi-plate images.",
     )
     parser.add_argument("--limit", type=int, default=0, help="Limit number of images processed (for quick testing).")
+    parser.add_argument("--sample-size", type=int, default=0, help="Randomly sample this many images. 0 = disabled.")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for --sample-size.")
+    parser.add_argument("--flat-output", action="store_true", help="Save output images directly under output folders.")
     parser.add_argument("--quiet", action="store_true", help="Suppress per-image status output.")
     return parser.parse_args()
 

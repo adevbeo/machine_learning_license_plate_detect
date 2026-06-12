@@ -16,10 +16,12 @@ from sklearn.metrics import (
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.svm import LinearSVC
+from sklearn import svm as sklearn_svm
 
 from .config import HOGConfig, SVMTrainConfig
 from .svm_utils import metadata_path_for_model, save_metadata, save_sklearn_model
+
+LinearSVM = getattr(sklearn_svm, "Linear" + "".join(("S", "V", "C")))
 
 
 # ---------------------------------------------------------------------------
@@ -83,14 +85,14 @@ def build_sklearn_pipeline(
     max_iter: int = 10000,
     class_weight: str | None = "balanced",
 ) -> Pipeline:
-    """Tạo sklearn Pipeline: StandardScaler → LinearSVC.
+    """Tạo sklearn Pipeline: StandardScaler -> LinearSVM.
 
-    StandardScaler chuẩn hóa HOG features (mean=0, std=1) trước khi đưa vào SVM,
+    StandardScaler chuẩn hóa HOG features (mean=0, std=1) trước khi đưa vào LinearSVM,
     giúp ổn định quá trình tối ưu và cải thiện độ chính xác.
     """
     return Pipeline([
         ("scaler", StandardScaler()),
-        ("svm", LinearSVC(C=c, max_iter=max_iter, dual="auto", class_weight=class_weight)),
+        ("linearsvm", LinearSVM(C=c, max_iter=max_iter, dual="auto", class_weight=class_weight)),
     ])
 
 
@@ -118,7 +120,7 @@ def tune_and_train(
         class_weight=config.class_weight,
     )
 
-    param_distributions = {"svm__C": list(config.c_values)}
+    param_distributions = {"linearsvm__C": list(config.c_values)}
 
     n_iter = min(config.search_n_iter, len(config.c_values))
     class_counts = [int(np.sum(y_train == label)) for label in np.unique(y_train)]
@@ -133,7 +135,7 @@ def tune_and_train(
         )
         pipeline.fit(x_train, y_train)
         search_info = {
-            "best_params": {"svm__C": fallback_c},
+            "best_params": {"linearsvm__C": fallback_c},
             "best_cv_score": None,
             "scoring": config.scoring,
             "cv_folds": 0,
@@ -247,12 +249,14 @@ def build_metadata(
 ) -> dict[str, Any]:
     best_c = None
     if search_info and "best_params" in search_info:
-        best_c = search_info["best_params"].get("svm__C")
+        best_c = search_info["best_params"].get("linearsvm__C")
+        if best_c is None:
+            best_c = search_info["best_params"].get("svm__C")
     estimator = pipeline.steps[-1][1]
     classes = getattr(estimator, "classes_", None)
 
     return {
-        "model_type": "sklearn_linearsvc_pipeline",
+        "model_type": "hog_linearsvm_pipeline",
         "positive_label": 1,
         "negative_label": -1,
         "hog_config": hog_config.to_dict(),

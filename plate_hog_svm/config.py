@@ -44,7 +44,7 @@ class HOGConfig:
 
 @dataclass(frozen=True)
 class SVMTrainConfig:
-    """Cấu hình cho quá trình huấn luyện sklearn SVM."""
+    """Cấu hình cho quá trình huấn luyện LinearSVM."""
 
     # Danh sách giá trị C để RandomizedSearchCV thử
     c_values: tuple[float, ...] = (0.001, 0.01, 0.1, 1.0, 10.0, 100.0)
@@ -54,7 +54,7 @@ class SVMTrainConfig:
     cv_folds: int = 5
     # Metric tối ưu: "f1", "f1_macro", "precision", "recall", "accuracy"
     scoring: str = "f1"
-    # max_iter cho LinearSVC
+    # max_iter cho LinearSVM
     max_iter: int = 10000
     # None hoặc "balanced"
     class_weight: str | None = "balanced"
