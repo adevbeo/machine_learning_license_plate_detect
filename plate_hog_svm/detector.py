@@ -172,7 +172,7 @@ class SlidingWindowDetector:
         )
 
 
-def draw_detection(image: np.ndarray, detection: Detection | None) -> np.ndarray:
+def draw_detection(image: np.ndarray, detection: Detection | None, label_prefix: str = "LinearSVM") -> np.ndarray:
     """Vẽ bbox lên ảnh (1 detection duy nhất)."""
     if image.ndim == 2:
         debug = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
@@ -184,12 +184,12 @@ def draw_detection(image: np.ndarray, detection: Detection | None) -> np.ndarray
 
     x, y, w, h = detection.bbox
     cv2.rectangle(debug, (x, y), (x + w, y + h), (0, 255, 0), 2)
-    label = f"LinearSVM {detection.confidence:.2f}"
+    label = f"{label_prefix} {detection.confidence:.2f}"
     cv2.putText(debug, label, (x, max(16, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
     return debug
 
 
-def draw_detections(image: np.ndarray, detections: list[Detection]) -> np.ndarray:
+def draw_detections(image: np.ndarray, detections: list[Detection], label_prefix: str = "") -> np.ndarray:
     """Vẽ nhiều bbox lên ảnh với màu phân biệt theo rank."""
     if image.ndim == 2:
         debug = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
@@ -203,7 +203,7 @@ def draw_detections(image: np.ndarray, detections: list[Detection]) -> np.ndarra
         color = colors[i] if i < len(colors) else (128, 128, 128)
         x, y, w, h = det.bbox
         cv2.rectangle(debug, (x, y), (x + w, y + h), color, 2)
-        label = f"#{i + 1} {det.confidence:.2f}"
+        label = f"{label_prefix} #{i + 1} {det.confidence:.2f}".strip()
         cv2.putText(debug, label, (x, max(16, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
     return debug

@@ -140,11 +140,11 @@ def process_images(args: argparse.Namespace) -> int:
         plate_path_str = str(plate_path_obj)
 
         if args.top_k > 1:
-            annotated = draw_detections(image, detections)
+            annotated = draw_detections(image, detections, args.bbox_label)
         else:
-            annotated = draw_detection(image, best)
+            annotated = draw_detection(image, best, args.bbox_label)
         if args.flat_output:
-            annotated_path_obj = flat_output_path(output_dir, image_path, "_linearsvm")
+            annotated_path_obj = flat_output_path(output_dir, image_path, args.annotated_suffix)
         else:
             annotated_path_obj = unique_output_path(output_dir, image_path, "_linearsvm")
         write_image(annotated_path_obj, annotated)
@@ -181,6 +181,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metadata", default="", help="Metadata JSON path. Defaults to model path + .json.")
     parser.add_argument("--plates-output", default="outputs/plates", help="Directory for cropped plate windows.")
     parser.add_argument("--output", default="outputs/output", help="Directory for images annotated with LinearSVM bbox.")
+    parser.add_argument("--bbox-label", default="LinearSVM", help="Text label drawn above the detection bbox.")
+    parser.add_argument("--annotated-suffix", default="_linearsvm", help="Filename suffix for annotated output images.")
     parser.add_argument("--report", default="outputs/detections.csv", help="CSV report path.")
     parser.add_argument("--html-report", default="outputs/report.html", help="HTML report path.")
     parser.add_argument("--max-width", type=int, default=900, help="Resize images to this width before scanning.")
